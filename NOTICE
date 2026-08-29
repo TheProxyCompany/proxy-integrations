@@ -1,0 +1,6 @@
+The attributed-body parser in src/messages.rs is a Rust adaptation of the
+MIT-licensed parser in mac_messages_mcp 0.9.2 by Carter LaSalle:
+https://github.com/carterlasalle/mac_messages_mcp
+
+No code from imessage-database or other GPL-licensed implementations is
+included in this repository.
