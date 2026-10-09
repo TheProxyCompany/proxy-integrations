@@ -88,7 +88,8 @@ pub struct MessageRecord {
     pub sent_at: Option<String>,
     pub subject: Option<String>,
     pub text: String,
-    /// Reply target GUID as stored by Messages, when present.
+    /// Raw reply_to_guid metadata from Messages, when present. Its presence
+    /// alone should not be interpreted as an iMessage threaded reply.
     #[serde(default)]
     pub reply_to_guid: Option<String>,
     /// GUID of the message that started this reply thread, when present.
