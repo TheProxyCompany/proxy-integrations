@@ -88,6 +88,13 @@ pub struct MessageRecord {
     pub sent_at: Option<String>,
     pub subject: Option<String>,
     pub text: String,
+    /// Reply target GUID as stored by Messages, when present.
+    #[serde(default)]
+    pub reply_to_guid: Option<String>,
+    /// GUID of the message that started this reply thread, when present.
+    /// This need not be the immediate reply target.
+    #[serde(default)]
+    pub thread_originator_guid: Option<String>,
     pub reaction: Option<Reaction>,
     pub attachments: Vec<Attachment>,
 }
@@ -325,7 +332,8 @@ fn query_messages(
                   COALESCE(NULLIF(c.guid, ''), NULLIF(c.chat_identifier, ''), 'chat-' || c.ROWID),
                   NULLIF(c.chat_identifier, ''), NULLIF(c.display_name, ''),
                   NULLIF(m.associated_message_guid, ''), m.associated_message_type,
-                  NULLIF(m.associated_message_emoji, '')
+                  NULLIF(m.associated_message_emoji, ''),
+                  NULLIF(m.reply_to_guid, ''), NULLIF(m.thread_originator_guid, '')
            FROM message m
            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
            JOIN chat c ON c.ROWID = cmj.chat_id
@@ -395,6 +403,8 @@ fn query_messages(
                 .filter(|text| !text.is_empty())
                 .or_else(|| attributed.as_deref().and_then(extract_attributed_body))
                 .unwrap_or_default(),
+            reply_to_guid: row.get(15)?,
+            thread_originator_guid: row.get(16)?,
             reaction: reaction(associated_guid, associated_type, associated_emoji),
             attachments: Vec::new(),
         });
@@ -687,7 +697,7 @@ mod tests {
                 ROWID INTEGER PRIMARY KEY, guid TEXT, date INTEGER, text TEXT, attributedBody BLOB,
                 is_from_me INTEGER, handle_id INTEGER, service TEXT, subject TEXT,
                 associated_message_guid TEXT, associated_message_type INTEGER,
-                associated_message_emoji TEXT
+                associated_message_emoji TEXT, reply_to_guid TEXT, thread_originator_guid TEXT
             );
             CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
             CREATE TABLE attachment (
@@ -703,12 +713,12 @@ mod tests {
         .unwrap();
         let now = Utc::now();
         conn.execute(
-            "INSERT INTO message VALUES (1, 'msg-old', ?1, 'older', NULL, 0, 1, 'iMessage', NULL, NULL, NULL, NULL)",
+            "INSERT INTO message VALUES (1, 'msg-old', ?1, 'older', NULL, 0, 1, 'iMessage', NULL, NULL, NULL, NULL, NULL, NULL)",
             params![to_apple_nanoseconds(now - ChronoDuration::minutes(2))],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO message VALUES (2, 'msg-new', ?1, NULL, ?2, 1, NULL, 'iMessage', NULL, NULL, NULL, NULL)",
+            "INSERT INTO message VALUES (2, 'msg-new', ?1, NULL, ?2, 1, NULL, 'iMessage', NULL, NULL, NULL, NULL, NULL, NULL)",
             params![to_apple_nanoseconds(now), attributed("typed body")],
         )
         .unwrap();
@@ -792,6 +802,83 @@ mod tests {
         let matches = store.search("typed", query).unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].guid, "msg-new");
+    }
+
+    #[test]
+    fn recent_and_search_preserve_reply_and_thread_guids_in_json() {
+        let (_dir, store) = fixture();
+        let conn = Connection::open(store.path()).unwrap();
+        // Keep these distinct: a reply target is not necessarily the thread root.
+        conn.execute(
+            "UPDATE message SET reply_to_guid = 'msg-parent', thread_originator_guid = 'msg-old' WHERE guid = 'msg-new'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let query = MessageQuery {
+            chat: Some("chat123".to_string()),
+            limit: 1,
+            ..MessageQuery::default()
+        };
+        for records in [
+            store.messages(query.clone()).unwrap(),
+            store.search("typed", query).unwrap(),
+        ] {
+            assert_eq!(records.len(), 1);
+            let reply = &records[0];
+            assert_eq!(reply.guid, "msg-new");
+            assert_eq!(reply.text, "typed body");
+            assert_eq!(reply.reply_to_guid.as_deref(), Some("msg-parent"));
+            assert_eq!(reply.thread_originator_guid.as_deref(), Some("msg-old"));
+            assert!(reply.reaction.is_none());
+            let json = serde_json::to_value(&records).unwrap();
+            assert_eq!(json[0]["reply_to_guid"], "msg-parent");
+            assert_eq!(json[0]["thread_originator_guid"], "msg-old");
+        }
+    }
+
+    #[test]
+    fn reply_links_are_independent_and_empty_links_are_none() {
+        let (_dir, store) = fixture();
+        let conn = Connection::open(store.path()).unwrap();
+        for (reply_to, thread_originator) in [
+            (None, None),
+            (Some(""), Some("")),
+            (Some("msg-parent"), None),
+            (None, Some("msg-old")),
+        ] {
+            conn.execute(
+                "UPDATE message SET reply_to_guid = ?1, thread_originator_guid = ?2 WHERE guid = 'msg-new'",
+                params![reply_to, thread_originator],
+            )
+            .unwrap();
+            for records in [
+                store.messages(MessageQuery::default()).unwrap(),
+                store.search("typed", MessageQuery::default()).unwrap(),
+            ] {
+                assert_eq!(
+                    records[0].reply_to_guid.as_deref(),
+                    reply_to.filter(|s| !s.is_empty())
+                );
+                assert_eq!(
+                    records[0].thread_originator_guid.as_deref(),
+                    thread_originator.filter(|s| !s.is_empty())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn message_records_deserialize_without_reply_fields() {
+        let (_dir, store) = fixture();
+        let record = store.messages(MessageQuery::default()).unwrap().remove(0);
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("reply_to_guid");
+        object.remove("thread_originator_guid");
+        let decoded: MessageRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded, record);
     }
 
     #[test]
