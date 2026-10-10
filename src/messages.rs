@@ -9,6 +9,9 @@ use rusqlite::{params, params_from_iter, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod send;
+pub use send::{SendReceipt, SendRequest, SentAttachment};
+
 const APPLE_EPOCH_UNIX_SECONDS: i64 = 978_307_200;
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
