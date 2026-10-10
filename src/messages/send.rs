@@ -96,16 +96,27 @@ impl MessagesStore {
             chat_guid,
             transport: "Messages",
             status: "not_sent",
-            text_status: if request.text.is_some() { "not_sent" } else { "not_requested" },
-            attachment_status: if request.attachment.is_some() { "not_sent" } else { "not_requested" },
+            text_status: if request.text.is_some() {
+                "not_sent"
+            } else {
+                "not_requested"
+            },
+            attachment_status: if request.attachment.is_some() {
+                "not_sent"
+            } else {
+                "not_requested"
+            },
             delivery_status: "unconfirmed",
             message_row_ids: Vec::new(),
             retry_safe: false,
-            attachment: request.attachment.as_ref().map(|(path, mime_type, size_bytes)| SentAttachment {
-                path: path.clone(),
-                mime_type,
-                size_bytes: *size_bytes,
-            }),
+            attachment: request
+                .attachment
+                .as_ref()
+                .map(|(path, mime_type, size_bytes)| SentAttachment {
+                    path: path.clone(),
+                    mime_type,
+                    size_bytes: *size_bytes,
+                }),
             error: None,
         };
 
@@ -126,7 +137,11 @@ impl MessagesStore {
             let staged = match stage(path) {
                 Ok(staged) => staged,
                 Err(error) => {
-                    receipt.status = if receipt.text_status == "sent" { "partial_failure" } else { "not_sent" };
+                    receipt.status = if receipt.text_status == "sent" {
+                        "partial_failure"
+                    } else {
+                        "not_sent"
+                    };
                     receipt.error = Some(error.to_string());
                     return Ok(receipt);
                 }
@@ -137,14 +152,19 @@ impl MessagesStore {
             };
             if let Err(error) = send_with_messages(script, &staged.to_string_lossy(), &target) {
                 receipt.attachment_status = "unknown";
-                receipt.status = if receipt.text_status == "sent" { "partial_failure" } else { "not_sent" };
+                receipt.status = if receipt.text_status == "sent" {
+                    "partial_failure"
+                } else {
+                    "not_sent"
+                };
                 receipt.error = Some(error);
                 return Ok(receipt);
             }
             receipt.attachment_status = "sent";
         }
 
-        let expected = usize::from(request.text.is_some()) + usize::from(request.attachment.is_some());
+        let expected =
+            usize::from(request.text.is_some()) + usize::from(request.attachment.is_some());
         receipt.message_row_ids = confirm(&conn, &target, baseline, expected)?;
         if receipt.message_row_ids.len() >= expected {
             receipt.success = true;
@@ -166,7 +186,9 @@ impl MessagesStore {
 fn validate(request: SendRequest) -> Result<Validated, MessagesError> {
     let recipient = request.recipient.trim().to_string();
     if recipient.is_empty() {
-        return Err(MessagesError::InvalidArgument("recipient cannot be empty".into()));
+        return Err(MessagesError::InvalidArgument(
+            "recipient cannot be empty".into(),
+        ));
     }
     let text = match request.text {
         Some(text) => {
@@ -180,19 +202,27 @@ fn validate(request: SendRequest) -> Result<Validated, MessagesError> {
         }
         None => None,
     };
-    let attachment = request.attachment_path.map(|path| validate_attachment(&path)).transpose()?;
+    let attachment = request
+        .attachment_path
+        .map(|path| validate_attachment(&path))
+        .transpose()?;
     if text.is_none() && attachment.is_none() {
         return Err(MessagesError::InvalidArgument(
             "text or attachment_path is required".into(),
         ));
     }
-    Ok(Validated { recipient, text, attachment })
+    Ok(Validated {
+        recipient,
+        text,
+        attachment,
+    })
 }
 
 /// The file must be a regular local JPEG, PNG, GIF, MP4 or MOV whose header
 /// matches its extension. Messages.app checks the media again when it imports.
 fn validate_attachment(path: &Path) -> Result<(PathBuf, &'static str, u64), MessagesError> {
-    let invalid = |message: &str| MessagesError::InvalidArgument(format!("attachment_path {message}"));
+    let invalid =
+        |message: &str| MessagesError::InvalidArgument(format!("attachment_path {message}"));
     if !path.is_absolute() {
         return Err(invalid("must be an absolute local file path"));
     }
@@ -203,22 +233,37 @@ fn validate_attachment(path: &Path) -> Result<(PathBuf, &'static str, u64), Mess
         .unwrap_or(true);
     if hidden_file
         || path.components().any(|component| {
-            sensitive.contains(&component.as_os_str().to_string_lossy().to_lowercase().as_str())
+            sensitive.contains(
+                &component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .as_str(),
+            )
         })
         || path.starts_with("/etc")
         || path.starts_with("/private/etc")
     {
         return Err(invalid("must not name a hidden or credential file"));
     }
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| invalid("must be an existing readable file"))?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| invalid("must be an existing readable file"))?;
     if !metadata.is_file() {
-        return Err(invalid("must be a regular file, not a symlink or directory"));
+        return Err(invalid(
+            "must be a regular file, not a symlink or directory",
+        ));
     }
     let size = metadata.len();
     if size == 0 || size > MAX_ATTACHMENT_BYTES {
-        return Err(invalid(&format!("must contain 1...{MAX_ATTACHMENT_BYTES} bytes")));
+        return Err(invalid(&format!(
+            "must contain 1...{MAX_ATTACHMENT_BYTES} bytes"
+        )));
     }
-    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
     let mut header = [0u8; 12];
     let read = std::fs::File::open(path)
         .and_then(|mut file| file.read(&mut header))
@@ -230,7 +275,11 @@ fn validate_attachment(path: &Path) -> Result<(PathBuf, &'static str, u64), Mess
         "gif" if header.starts_with(b"GIF8") => "image/gif",
         "mp4" if header.len() >= 8 && &header[4..8] == b"ftyp" => "video/mp4",
         "mov" if header.len() >= 8 && &header[4..8] == b"ftyp" => "video/quicktime",
-        _ => return Err(invalid("must be a JPEG, PNG, GIF, MP4 or MOV whose contents match its extension")),
+        _ => {
+            return Err(invalid(
+                "must be a JPEG, PNG, GIF, MP4 or MOV whose contents match its extension",
+            ))
+        }
     };
     Ok((path.to_path_buf(), mime_type, size))
 }
@@ -370,7 +419,10 @@ fn stage(path: &Path) -> Result<PathBuf, std::io::Error> {
             }
         }
     }
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     let directory = root.join(format!("{STAGING_PREFIX}{}-{stamp}", std::process::id()));
     std::fs::create_dir(&directory)?;
     #[cfg(unix)]
@@ -384,7 +436,11 @@ fn stage(path: &Path) -> Result<PathBuf, std::io::Error> {
 }
 
 fn latest_message_row_id(conn: &Connection) -> Result<i64, MessagesError> {
-    Ok(conn.query_row("SELECT COALESCE(MAX(ROWID), 0) FROM message", [], |row| row.get(0))?)
+    Ok(
+        conn.query_row("SELECT COALESCE(MAX(ROWID), 0) FROM message", [], |row| {
+            row.get(0)
+        })?,
+    )
 }
 
 /// Reads chat.db until the outgoing rows for this send appear in the target
@@ -462,7 +518,10 @@ mod tests {
     #[test]
     fn a_group_chat_resolves_from_its_identifier_guid_row_id_or_other_polarity() {
         let conn = fixture();
-        let expected = Target::Chat { row_id: 2, guid: "any;+;chat85437876530692212".into() };
+        let expected = Target::Chat {
+            row_id: 2,
+            guid: "any;+;chat85437876530692212".into(),
+        };
         for spelling in [
             "chat85437876530692212",
             "any;+;chat85437876530692212",
@@ -470,7 +529,11 @@ mod tests {
             "iMessage;+;chat85437876530692212",
             "2",
         ] {
-            assert_eq!(resolve_target(&conn, spelling).unwrap(), expected, "{spelling}");
+            assert_eq!(
+                resolve_target(&conn, spelling).unwrap(),
+                expected,
+                "{spelling}"
+            );
         }
     }
 
@@ -479,7 +542,10 @@ mod tests {
         let conn = fixture();
         assert_eq!(
             resolve_target(&conn, "+13025353508").unwrap(),
-            Target::Chat { row_id: 3, guid: "any;-;+13025353508".into() }
+            Target::Chat {
+                row_id: 3,
+                guid: "any;-;+13025353508".into()
+            }
         );
         assert_eq!(
             resolve_target(&conn, "someone@example.test").unwrap(),
@@ -507,7 +573,10 @@ mod tests {
              INSERT INTO chat_message_join VALUES (2, 13);",
         )
         .unwrap();
-        let target = Target::Chat { row_id: 2, guid: "any;+;chat85437876530692212".into() };
+        let target = Target::Chat {
+            row_id: 2,
+            guid: "any;+;chat85437876530692212".into(),
+        };
         assert_eq!(outgoing_rows_since(&conn, &target, 10).unwrap(), vec![13]);
         let direct = Target::Participant("+13025353508".into());
         assert_eq!(outgoing_rows_since(&conn, &direct, 10).unwrap(), vec![13]);
@@ -545,13 +614,28 @@ mod tests {
 
     #[test]
     fn validation_needs_text_or_an_attachment() {
-        let error = validate(SendRequest { recipient: " ".into(), ..Default::default() }).unwrap_err();
+        let error = validate(SendRequest {
+            recipient: " ".into(),
+            ..Default::default()
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("recipient"));
-        let error = validate(SendRequest { recipient: "+1".into(), text: Some("  ".into()), ..Default::default() })
-            .unwrap_err();
+        let error = validate(SendRequest {
+            recipient: "+1".into(),
+            text: Some("  ".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("text or attachment_path"));
-        let ok = validate(SendRequest { recipient: " +1 ".into(), text: Some(" hi ".into()), ..Default::default() })
-            .unwrap();
-        assert_eq!((ok.recipient.as_str(), ok.text.as_deref()), ("+1", Some("hi")));
+        let ok = validate(SendRequest {
+            recipient: " +1 ".into(),
+            text: Some(" hi ".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            (ok.recipient.as_str(), ok.text.as_deref()),
+            ("+1", Some("hi"))
+        );
     }
 }
