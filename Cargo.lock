@@ -574,19 +574,3 @@ checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
-
-[[patch.unused]]
-name = "grand-central"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "pane"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "trellis"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "orchard-rs"
-version = "2026.6.2"
