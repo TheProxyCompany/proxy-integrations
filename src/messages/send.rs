@@ -2,8 +2,9 @@
 //! is asked over `osascript` with the text and target as argv, and chat.db is
 //! read again to confirm the outgoing row landed in that chat.
 
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -78,12 +79,12 @@ pub enum Target {
 struct Validated {
     recipient: String,
     text: Option<String>,
-    attachment: Option<(PathBuf, &'static str, u64)>,
+    attachment: Option<(PathBuf, &'static str, u64, File)>,
 }
 
 impl MessagesStore {
     pub fn send(&self, request: SendRequest) -> Result<SendReceipt, MessagesError> {
-        let request = validate(request)?;
+        let mut request = validate(request)?;
         let conn = self.open()?;
         let target = resolve_target(&conn, &request.recipient)?;
         let chat_guid = match &target {
@@ -112,7 +113,7 @@ impl MessagesStore {
             attachment: request
                 .attachment
                 .as_ref()
-                .map(|(path, mime_type, size_bytes)| SentAttachment {
+                .map(|(path, mime_type, size_bytes, _)| SentAttachment {
                     path: path.clone(),
                     mime_type,
                     size_bytes: *size_bytes,
@@ -133,8 +134,8 @@ impl MessagesStore {
             }
             receipt.text_status = "sent";
         }
-        if let Some((path, _, _)) = &request.attachment {
-            let staged = match stage(path) {
+        if let Some((path, _, _, source)) = &mut request.attachment {
+            let staged = match stage(source, path) {
                 Ok(staged) => staged,
                 Err(error) => {
                     receipt.status = if receipt.text_status == "sent" {
@@ -218,35 +219,42 @@ fn validate(request: SendRequest) -> Result<Validated, MessagesError> {
     })
 }
 
+const FORBIDDEN_ATTACHMENT_DIRS: &[&str] =
+    &[".ssh", ".aws", ".azure", ".gnupg", ".kube", "keychains"];
+
 /// The file must be a regular local JPEG, PNG, GIF, MP4 or MOV whose header
 /// matches its extension. Messages.app checks the media again when it imports.
-fn validate_attachment(path: &Path) -> Result<(PathBuf, &'static str, u64), MessagesError> {
+///
+/// The open is the check. The leaf is opened with `O_NOFOLLOW`, its kernel
+/// resolved path is checked against the denylist so a symlink ancestor naming a
+/// credential directory is refused, and the opened handle is retained for
+/// [`stage`] so a symlink or file swapped in after validation is never opened.
+fn validate_attachment(path: &Path) -> Result<(PathBuf, &'static str, u64, File), MessagesError> {
     let invalid =
         |message: &str| MessagesError::InvalidArgument(format!("attachment_path {message}"));
     if !path.is_absolute() {
         return Err(invalid("must be an absolute local file path"));
     }
-    let sensitive = [".ssh", ".aws", ".azure", ".gnupg", ".kube", "keychains"];
-    let hidden_file = path
+    let hidden_caller_leaf = path
         .file_name()
         .map(|name| name.to_string_lossy().starts_with('.'))
         .unwrap_or(true);
-    if hidden_file
-        || path.components().any(|component| {
-            sensitive.contains(
-                &component
-                    .as_os_str()
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .as_str(),
-            )
-        })
-        || path.starts_with("/etc")
-        || path.starts_with("/private/etc")
-    {
+    if hidden_caller_leaf || attachment_path_is_forbidden(path) {
         return Err(invalid("must not name a hidden or credential file"));
     }
-    let metadata = std::fs::symlink_metadata(path)
+    let mut file = open_regular_nofollow(path)
+        .map_err(|_| invalid("must be a regular file, not a symlink or directory"))?;
+    let resolved =
+        resolved_path(&file).map_err(|_| invalid("must be an existing readable file"))?;
+    let hidden_file = resolved
+        .file_name()
+        .map(|name| name.to_string_lossy().starts_with('.'))
+        .unwrap_or(true);
+    if hidden_file || attachment_path_is_forbidden(&resolved) {
+        return Err(invalid("must not name a hidden or credential file"));
+    }
+    let metadata = file
+        .metadata()
         .map_err(|_| invalid("must be an existing readable file"))?;
     if !metadata.is_file() {
         return Err(invalid(
@@ -259,14 +267,16 @@ fn validate_attachment(path: &Path) -> Result<(PathBuf, &'static str, u64), Mess
             "must contain 1...{MAX_ATTACHMENT_BYTES} bytes"
         )));
     }
-    let extension = path
+    let extension = resolved
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
     let mut header = [0u8; 12];
-    let read = std::fs::File::open(path)
-        .and_then(|mut file| file.read(&mut header))
+    let read = file
+        .read(&mut header)
+        .map_err(|_| invalid("must be readable"))?;
+    file.seek(SeekFrom::Start(0))
         .map_err(|_| invalid("must be readable"))?;
     let header = &header[..read];
     let mime_type = match extension.as_str() {
@@ -281,7 +291,57 @@ fn validate_attachment(path: &Path) -> Result<(PathBuf, &'static str, u64), Mess
             ))
         }
     };
-    Ok((path.to_path_buf(), mime_type, size))
+    Ok((path.to_path_buf(), mime_type, size, file))
+}
+
+/// The denylist, checked on both the caller path and the path the kernel opened.
+/// A symlink ancestor resolves to the denied directory, so the caller's spelling
+/// no longer decides what the check sees.
+fn attachment_path_is_forbidden(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(name) => {
+            FORBIDDEN_ATTACHMENT_DIRS.contains(&name.to_string_lossy().to_lowercase().as_str())
+        }
+        _ => false,
+    }) || path.starts_with("/etc")
+        || path.starts_with("/private/etc")
+}
+
+/// Opens the leaf without following a symlink there. The ancestor walk still
+/// follows, and [`resolved_path`] reads back where it landed so the denylist
+/// sees the real directory instead of the one the caller spelled.
+fn open_regular_nofollow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    const O_NOFOLLOW: i32 = 0x0100;
+    File::options()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+}
+
+/// Where the open landed, after every ancestor symlink. macOS `F_GETPATH`
+/// returns the resolved path of the descriptor, so a file swapped in between
+/// the open and this read is the file the descriptor holds, not the one the
+/// name pointed at afterwards.
+fn resolved_path(file: &File) -> std::io::Result<PathBuf> {
+    use std::os::unix::io::AsRawFd;
+    const F_GETPATH: i32 = 50;
+    let mut buf = [0u8; 4096];
+    let rc = unsafe { libc_fcntl(file.as_raw_fd(), F_GETPATH, buf.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&buf[..end]).into_owned(),
+    ))
+}
+
+unsafe fn libc_fcntl(fd: i32, cmd: i32, path: *mut u8) -> i32 {
+    extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    fcntl(fd, cmd, path)
 }
 
 /// Finds the chat a recipient names: a chat row id, `chat_identifier`, GUID in
@@ -402,8 +462,10 @@ fn write_and_wait(mut child: Child, script: &str, timeout: Duration) -> Result<(
 
 /// Messages.app imports an attachment after the send returns, so the file is
 /// copied to a private folder that outlives the call. Copies older than a day
-/// are removed on the next send.
-fn stage(path: &Path) -> Result<PathBuf, std::io::Error> {
+/// are removed on the next send. The bytes come from the handle that
+/// [`validate_attachment`] opened with `O_NOFOLLOW`, never from a fresh open of
+/// the path, so a symlink or file swapped in after validation is never staged.
+fn stage(source: &mut File, path: &Path) -> Result<PathBuf, std::io::Error> {
     let root = std::env::temp_dir();
     if let Ok(entries) = std::fs::read_dir(&root) {
         for entry in entries.flatten() {
@@ -431,7 +493,9 @@ fn stage(path: &Path) -> Result<PathBuf, std::io::Error> {
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
     }
     let file = directory.join(path.file_name().unwrap_or_default());
-    std::fs::copy(path, &file)?;
+    source.seek(SeekFrom::Start(0))?;
+    let mut staged = File::create(&file)?;
+    std::io::copy(source, &mut staged)?;
     Ok(file)
 }
 
@@ -595,6 +659,43 @@ mod tests {
         std::os::unix::fs::symlink(&png, &link).unwrap();
         assert!(validate_attachment(&link).is_err());
         assert!(validate_attachment(Path::new("relative.png")).is_err());
+
+        let ssh_dir = dir.path().join(".ssh");
+        std::fs::create_dir(&ssh_dir).unwrap();
+        let ssh_png = ssh_dir.join("shot.png");
+        std::fs::write(&ssh_png, [0x89, b'P', b'N', b'G', 0, 0]).unwrap();
+        let benign_alias = dir.path().join("benign_dir");
+        std::os::unix::fs::symlink(&ssh_dir, &benign_alias).unwrap();
+        assert!(
+            validate_attachment(&benign_alias.join("shot.png")).is_err(),
+            "symlink ancestor pointing into .ssh must be refused"
+        );
+    }
+
+    #[test]
+    fn the_staged_bytes_are_the_validated_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        let body = b"\x89PNG\r\nbody".to_vec();
+        std::fs::write(&png, &body).unwrap();
+        let (_, _, _, mut validated_file) = validate_attachment(&png).unwrap();
+
+        let secret = dir.path().join("secret.png");
+        std::fs::write(&secret, b"SECRET-KEY-MATERIAL-NOT-MEDIA").unwrap();
+        std::fs::remove_file(&png).unwrap();
+        std::os::unix::fs::symlink(&secret, &png).unwrap();
+
+        let staged = stage(&mut validated_file, &png).unwrap();
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            body,
+            "staged bytes must come from the validated handle even after path swap"
+        );
+        assert!(std::fs::symlink_metadata(&staged).unwrap().is_file());
+        assert!(
+            open_regular_nofollow(&png).is_err(),
+            "O_NOFOLLOW must refuse a swapped symlink"
+        );
     }
 
     #[test]
