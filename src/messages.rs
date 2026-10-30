@@ -605,6 +605,7 @@ fn contact_lookup_keys(handle: &str) -> Vec<String> {
     keys
 }
 
+#[allow(clippy::let_and_return)]
 fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
     let sql = format!("PRAGMA table_info({table})");
     let Ok(mut stmt) = conn.prepare(&sql) else {
