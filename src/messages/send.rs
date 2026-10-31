@@ -27,10 +27,10 @@ const TEXT_TO_PARTICIPANT: &str = "on run argv
 tell application \"Messages\" to send (item 1 of argv) to participant (item 2 of argv) of 1st account whose service type is iMessage
 end run";
 const FILE_TO_CHAT: &str = "on run argv
-tell application \"Messages\" to send (POSIX file (item 1 of argv)) to chat id (item 2 of argv)
+tell application \"Messages\" to send ((POSIX file (item 1 of argv)) as alias) to chat id (item 2 of argv)
 end run";
 const FILE_TO_PARTICIPANT: &str = "on run argv
-tell application \"Messages\" to send (POSIX file (item 1 of argv)) to participant (item 2 of argv) of 1st account whose service type is iMessage
+tell application \"Messages\" to send ((POSIX file (item 1 of argv)) as alias) to participant (item 2 of argv) of 1st account whose service type is iMessage
 end run";
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -286,8 +286,8 @@ fn validate_attachment(path: &Path) -> Result<(PathBuf, &'static str, u64), Mess
         .map_err(|_| invalid("must be readable"))?;
     let header = &header[..read];
     let mime_type = match extension.as_str() {
-        "jpg" | "jpeg" if header.starts_with(&[0xFF, 0xD8, 0xFF]) => "image/jpeg",
-        "png" if header.starts_with(&[0x89, b'P', b'N', b'G']) => "image/png",
+        "jpg" | "jpeg" | "png" if header.starts_with(&[0xFF, 0xD8, 0xFF]) => "image/jpeg",
+        "png" | "jpg" | "jpeg" if header.starts_with(&[0x89, b'P', b'N', b'G']) => "image/png",
         "gif" if header.starts_with(b"GIF8") => "image/gif",
         "mp4" if header.len() >= 8 && &header[4..8] == b"ftyp" => "video/mp4",
         "mov" if header.len() >= 8 && &header[4..8] == b"ftyp" => "video/quicktime",
@@ -428,7 +428,10 @@ fn write_and_wait(mut child: Child, script: &str, timeout: Duration) -> Result<(
 /// copied to a private folder that outlives the call. Copies older than a day
 /// are removed on the next send.
 fn stage(path: &Path) -> Result<PathBuf, std::io::Error> {
-    let root = std::env::temp_dir();
+    let root = std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join("Pictures"))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
     if let Ok(entries) = std::fs::read_dir(&root) {
         for entry in entries.flatten() {
             let name = entry.file_name();
