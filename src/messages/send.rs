@@ -83,6 +83,19 @@ struct Validated {
 
 impl MessagesStore {
     pub fn send(&self, request: SendRequest) -> Result<SendReceipt, MessagesError> {
+        self.send_with_runner(request, run_osascript)
+    }
+
+    // Keep the external Apple-event runner separate so the complete request,
+    // target resolution and confirmation path can be checked without sending.
+    fn send_with_runner<F>(
+        &self,
+        request: SendRequest,
+        mut runner: F,
+    ) -> Result<SendReceipt, MessagesError>
+    where
+        F: FnMut(&str, &str, &str) -> Result<(), String>,
+    {
         let request = validate(request)?;
         let conn = self.open()?;
         let target = resolve_target(&conn, &request.recipient)?;
@@ -126,7 +139,7 @@ impl MessagesStore {
                 Target::Chat { .. } => TEXT_TO_CHAT,
                 Target::Participant(_) => TEXT_TO_PARTICIPANT,
             };
-            if let Err(error) = send_with_messages(script, text, &target) {
+            if let Err(error) = send_with_messages(script, text, &target, &mut runner) {
                 receipt.text_status = "unknown";
                 receipt.error = Some(error);
                 return Ok(receipt);
@@ -150,7 +163,9 @@ impl MessagesStore {
                 Target::Chat { .. } => FILE_TO_CHAT,
                 Target::Participant(_) => FILE_TO_PARTICIPANT,
             };
-            if let Err(error) = send_with_messages(script, &staged.to_string_lossy(), &target) {
+            if let Err(error) =
+                send_with_messages(script, &staged.to_string_lossy(), &target, &mut runner)
+            {
                 receipt.attachment_status = "unknown";
                 receipt.status = if receipt.text_status == "sent" {
                     "partial_failure"
@@ -192,13 +207,14 @@ fn validate(request: SendRequest) -> Result<Validated, MessagesError> {
     }
     let text = match request.text {
         Some(text) => {
-            let trimmed = text.trim().to_string();
-            if trimmed.chars().count() > MAX_TEXT_CHARS {
+            if text.chars().count() > MAX_TEXT_CHARS {
                 return Err(MessagesError::InvalidArgument(format!(
                     "text must be at most {MAX_TEXT_CHARS} characters"
                 )));
             }
-            (!trimmed.is_empty()).then_some(trimmed)
+            // Approval names the original draft, including its whitespace.
+            // Trimming decides only whether any text was requested.
+            (!text.trim().is_empty()).then_some(text)
         }
         None => None,
     };
@@ -320,18 +336,26 @@ pub fn resolve_target(conn: &Connection, recipient: &str) -> Result<Target, Mess
     Ok(Target::Participant(recipient.to_string()))
 }
 
-fn send_with_messages(script: &str, payload: &str, target: &Target) -> Result<(), String> {
+fn send_with_messages<F>(
+    script: &str,
+    payload: &str,
+    target: &Target,
+    runner: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&str, &str, &str) -> Result<(), String>,
+{
     let address = match target {
         Target::Chat { guid, .. } => guid.as_str(),
         Target::Participant(handle) => handle.as_str(),
     };
-    match run_osascript(script, payload, address) {
+    match runner(script, payload, address) {
         Err(error) if error.contains("-1728") => {
             if let Target::Chat { guid, .. } = target {
                 // Messages.app sometimes lists a group chat with the other polarity.
                 let flipped = flip_polarity(guid);
                 if flipped != *guid {
-                    return run_osascript(script, payload, &flipped);
+                    return runner(script, payload, &flipped);
                 }
             }
             Err(error)
@@ -495,6 +519,10 @@ pub fn outgoing_rows_since(
 }
 
 #[cfg(test)]
+#[path = "send/exact_text_tests.rs"]
+mod exact_text_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -638,7 +666,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             (ok.recipient.as_str(), ok.text.as_deref()),
-            ("+1", Some("hi"))
+            ("+1", Some(" hi "))
         );
     }
 }
